@@ -12,12 +12,16 @@ argument-hint: "[status|pause|resume|clear|complete] [--tokens N] <objective>"
 
 ## Architecture Overview
 
-**Parent Claude (you)** — routes only. Never performs domain work. Stays clean.
-**Orchestrator subagent** — decomposes goal, plans steps, spawns workers, aggregates, verifies.
-**Worker subagents** — each executes one step, writes output file + status JSON, never more.
+**Parent Claude (you)** — orchestrates directly. Reads state, decomposes goal, plans steps,
+executes rounds, spawns workers, spawns verifier, finalizes. Context stays clean because all
+step outputs live on disk — no domain reasoning crosses a context boundary without being
+written first.
+**Worker subagents** — each executes exactly one step. Writes output file + status JSON.
+Cannot spawn further agents.
+**Verification subagent** — reads all step outputs. Writes verification report. Cannot spawn
+further agents.
 
-State is always on disk. Subagents read from files — not from context. No reasoning crosses a
-context boundary without being written first. This is what keeps the parent clean and makes
+State is always on disk. Subagents read from files — not from context. This is what makes
 arbitrarily long tasks reliable.
 
 ---
@@ -33,7 +37,7 @@ python3 ~/.claude/skills/goal/scripts/claude_goal.py invoke "$ARGUMENTS"
 
 **Windows (PowerShell):**
 ```powershell
-python "$env:USERPROFILE\.claude\skills\goal\scripts\claude_goal.py" invoke "$ARGUMENTS"
+python "C:\Users\$env:USERNAME\.claude\skills\goal\scripts\claude_goal.py" invoke "$ARGUMENTS"
 ```
 
 Read the output carefully. Note the `Action:` field on the first line.
@@ -42,9 +46,43 @@ Read the output carefully. Note the `Action:` field on the first line.
 
 ## Step 2 — Branch on Action
 
-### If Action is `status`, `pause`, `resume`, `clear`, or `complete`
+### If Action is `status`, `pause`, `clear`, or `complete`
 
 Report the helper script output to the user. You are done. No subagent needed.
+
+---
+
+### If Action is `resume`
+
+Run the goal helper json command to get workspace path:
+
+**macOS / Linux:**
+```bash
+python3 ~/.claude/skills/goal/scripts/claude_goal.py json
+```
+
+**Windows:**
+```powershell
+python "C:\Users\$env:USERNAME\.claude\skills\goal\scripts\claude_goal.py" json
+```
+
+Extract `session_id` and `workspace` from the JSON output. Reconstruct workspace path:
+- **macOS/Linux:** `~/.claude/goal-sub/workspaces/{session_id}/`
+- **Windows:** `C:\Users\{USERNAME}\.claude\goal-sub\workspaces\{session_id}\`
+
+Read `{workspace}/goal-state.json`. Determine re-entry point:
+
+- If `status` is `"executing"` and `orchestrator.steps_completed` does not contain all step IDs
+  in `orchestrator.step_plan`: **re-enter at Step 5** to continue executing incomplete rounds.
+  The completed step IDs in `orchestrator.steps_completed` are already done — only execute
+  rounds that contain at least one step not yet in that list.
+
+- If all step IDs are in `orchestrator.steps_completed` but
+  `{workspace}/verification/report.md` does not exist: **re-enter at Step 6** to spawn the
+  verification subagent.
+
+- If `{workspace}/verification/report.md` exists: **re-enter at Step 7** to finalize state
+  and report to the user.
 
 ---
 
@@ -65,14 +103,14 @@ python3 ~/.claude/skills/goal/scripts/claude_goal.py json
 
 **Windows:**
 ```powershell
-python "$env:USERPROFILE\.claude\skills\goal\scripts\claude_goal.py" json
+python "C:\Users\$env:USERNAME\.claude\skills\goal\scripts\claude_goal.py" json
 ```
 
 Extract `session_id` and `objective` from the JSON output.
 
-Determine the workspace base path:
+Set workspace path:
 - **macOS/Linux:** `~/.claude/goal-sub/workspaces/{session_id}/`
-- **Windows:** resolve `$env:USERPROFILE\.claude\goal-sub\workspaces\{session_id}\`
+- **Windows:** `C:\Users\{USERNAME}\.claude\goal-sub\workspaces\{session_id}\`
 
 Create the workspace directory structure:
 
@@ -84,9 +122,8 @@ mkdir -p ~/.claude/goal-sub/workspaces/{session_id}/verification
 
 **Windows:**
 ```powershell
-$base = "$env:USERPROFILE\.claude\goal-sub\workspaces\{session_id}"
-New-Item -ItemType Directory -Path "$base\steps" -Force
-New-Item -ItemType Directory -Path "$base\verification" -Force
+New-Item -ItemType Directory -Path "C:\Users\$env:USERNAME\.claude\goal-sub\workspaces\{session_id}\steps" -Force
+New-Item -ItemType Directory -Path "C:\Users\$env:USERNAME\.claude\goal-sub\workspaces\{session_id}\verification" -Force
 ```
 
 Write `{workspace}/goal-state.json` with this exact structure (substitute all values):
@@ -117,62 +154,9 @@ Write `{workspace}/goal-state.json` with this exact structure (substitute all va
 
 ---
 
-## Step 4 — Spawn the Orchestrator Subagent
+## Step 4 — Parent Decomposes Goal
 
-Spawn ONE orchestrator subagent using the Agent tool. Pass the constructed prompt below with
-ALL placeholders filled. The parent waits for it to complete. Do not do any domain work yourself.
-
-**Construct the orchestrator prompt by substituting:**
-- `{OBJECTIVE}` → the full objective string from goal-state.json
-- `{WORKSPACE}` → the absolute workspace path (no trailing slash)
-- `{SESSION_ID}` → the session ID string
-
----
-
-```
-## GOAL ANCHOR — read this before any other action
-
-Objective: {OBJECTIVE}
-Session: {SESSION_ID}
-Goal state file: {WORKSPACE}/goal-state.json
-
-You MUST read goal-state.json before taking any action.
-You MUST NOT report completion without file-existence evidence for every required output.
-COMPLETION (VERIFIED / ASSUMED / PARTIAL / FAILED) and CONFIDENCE (HIGH / MEDIUM / LOW) are
-always reported as separate fields — never combined.
-
-## END GOAL ANCHOR
-
----
-
-## Your Role: Orchestrator
-
-You are the orchestrator for this goal-sub execution. Your job has exactly four responsibilities:
-
-1. Decompose the objective into concrete, verifiable steps
-2. Spawn worker subagents to execute steps (parallel where independent, sequential where dependent)
-3. Verify each worker produced its required output file
-4. Spawn a verification subagent and finalize the goal-state.json
-
-You WILL NOT perform domain work directly. You WILL NOT write code, research topics, create
-files with content, or execute task steps yourself. All of that goes to worker subagents.
-Your only outputs are: spawning subagents, verifying file existence, and writing goal-state.json.
-
----
-
-## Workspace
-
-All files for this session live here: {WORKSPACE}
-Goal state file: {WORKSPACE}/goal-state.json
-Steps directory: {WORKSPACE}/steps/
-Verification directory: {WORKSPACE}/verification/
-
----
-
-## Phase 1: Read State and Create Step Plan
-
-Read {WORKSPACE}/goal-state.json using the Read tool.
-Extract the objective field.
+Read `{WORKSPACE}/goal-state.json` using the Read tool. Extract the `objective` field.
 
 Analyze the objective and produce a step plan. Apply these rules:
 
@@ -202,52 +186,69 @@ Analyze the objective and produce a step plan. Apply these rules:
 ]
 ```
 
-Read {WORKSPACE}/goal-state.json again. Update it to add the step plan:
+Read `{WORKSPACE}/goal-state.json` again. Update it:
 - Set `orchestrator.step_plan` to the step plan array
 - Set `orchestrator.steps_total` to the number of steps
-- Set `orchestrator.status` to "executing"
-- Set `status` to "executing"
+- Set `orchestrator.status` to `"executing"`
+- Set `status` to `"executing"`
 - Update `updated_at` to current ISO8601 timestamp
 
-Write the updated JSON back to {WORKSPACE}/goal-state.json.
+Write the updated JSON back to `{WORKSPACE}/goal-state.json`.
 
-Create each step directory. For each step in the plan:
-- Create {WORKSPACE}/steps/{step-id}/ directory
+Create each step directory:
+
+**macOS/Linux:**
+```bash
+mkdir -p {WORKSPACE}/steps/{step-id}
+```
+
+**Windows:**
+```powershell
+New-Item -ItemType Directory -Path "{WORKSPACE}\steps\{step-id}" -Force
+```
+
+(Repeat for every step in the plan.)
+
+If `--tokens N` was passed in the original invocation, record the token budget: you will inject
+"Token budget for this step: approximately {N}" into each worker prompt in Step 5.
 
 ---
 
-## Phase 2: Execute Steps in Dependency Order
+## Step 5 — Parent Executes Rounds
 
-Determine the execution order: group steps into rounds where all steps in a round have
-their dependencies already completed.
+Group steps into dependency rounds:
 
-Round 0 = all steps with empty dependencies array.
-Round 1 = all steps whose only dependencies are in Round 0. And so on.
+- Round 0 = all steps with empty `dependencies` array
+- Round N = all steps whose only dependencies are in rounds 0 through N-1
 
 **For each round:**
 
-A) Construct a worker prompt for every step in this round. Use the template below.
-   Fill ALL placeholders before spawning.
+**A)** Build a worker prompt for every step in the round. Use the template below.
+   Fill ALL placeholders. If a token budget was recorded in Step 4, append as a note.
 
-B) Spawn ALL steps in this round simultaneously in a SINGLE Agent tool call message
-   (multiple Agent blocks in one response). Do not spawn them one at a time.
+**B)** Spawn ALL steps in the round simultaneously in a **SINGLE message** with multiple
+   Agent tool call blocks. Do not spawn them one at a time.
 
-C) After ALL workers in the round complete:
-   - For each step: verify its output_file exists using the Read tool or Glob
+**C)** After ALL workers in the round complete:
+   - For each step: verify its `output_file` exists using the Read tool or Glob.
    - If a file is missing: re-spawn that worker ONCE with the original prompt prepended by:
-     "CRITICAL: Your previous run did not write the required output file. You MUST write
-     {output_file} before returning. Do not stop without writing it."
-   - Read each step's status.json
-   - Update {WORKSPACE}/goal-state.json: add each step ID to `orchestrator.steps_completed`,
-     update `updated_at`
+     `"CRITICAL: Your previous run did not write the required output file. You MUST write
+     {output_file} before returning. Do not stop without writing it."`
+   - If still missing after retry: read or create its `status_file` with
+     `"completion": "FAILED"` and `"notes": "Output file not written after two attempts."`.
+     Continue with remaining steps rather than blocking the whole run.
+   - Read each step's `status.json`.
+   - Update `{WORKSPACE}/goal-state.json`: add completed step IDs to
+     `orchestrator.steps_completed`, update `updated_at`.
 
-D) Proceed to the next round.
+**D)** Proceed to the next round only after all steps in the current round have written
+   outputs or been marked FAILED.
 
 ---
 
 ### Worker Prompt Template
 
-For each step, build this prompt (substitute ALL placeholders):
+For each step, construct this prompt (substitute ALL placeholders):
 
 ```
 ## GOAL ANCHOR — read before acting
@@ -318,22 +319,24 @@ Completion status definitions:
 - You MUST write {STEP_OUTPUT_FILE} before returning. This is non-negotiable.
 - You MUST write {STEP_STATUS_FILE} before returning. This is non-negotiable.
 - Do not return without writing both files.
+- Do not spawn subagents.
 - Base completion on tool-call evidence, not inference.
 - If you encounter a blocker: document it in status.json with completion: "FAILED" and notes explaining the blocker. Then write a partial output file with what you were able to produce.
 ```
 
-**For the {INPUT_FILES_LIST} field:**
-- If dependencies is empty: write "none"
-- Otherwise: list each dependency's output_file path on a separate line
+**For the `{INPUT_FILES_LIST}` field:**
+- If `dependencies` is empty: write `"none"`
+- Otherwise: list each dependency's `output_file` path on a separate line
 
 ---
 
-## Phase 3: Spawn Verification Subagent
+## Step 6 — Parent Spawns Verification Subagent
 
-After all steps complete, read {WORKSPACE}/goal-state.json to confirm
-`orchestrator.steps_completed` contains all step IDs.
+Read `{WORKSPACE}/goal-state.json`. Confirm `orchestrator.steps_completed` contains all step
+IDs that did not FAIL.
 
-Spawn one verification subagent with this prompt (fill all placeholders):
+Collect all `output_file` paths from steps that completed (not FAILED). Spawn ONE verification
+subagent with the prompt below (fill all placeholders):
 
 ```
 ## GOAL ANCHOR
@@ -365,9 +368,9 @@ Read all step output files listed below and determine whether the objective is a
 
 ---
 
-## Required Output
+## Required Output: {WORKSPACE}/verification/report.md
 
-Write {WORKSPACE}/verification/report.md with this exact format:
+Write this file with this exact format:
 
 # Verification Report
 
@@ -387,20 +390,24 @@ Confidence: HIGH | MEDIUM | LOW
 ## Summary
 [2-3 sentences: what was accomplished, what remains if anything]
 
-You MUST write this file before returning. Base your verdict on what you actually read
-in the step output files, not on inference about what should have been produced.
+---
+
+## Hard Constraints
+
+- Write {WORKSPACE}/verification/report.md before returning.
+- Do not spawn subagents.
+- Base your verdict on what you actually read in the step output files, not on inference.
 ```
 
 ---
 
-## Phase 4: Finalize State and Return
+## Step 7 — Parent Finalizes
 
-After the verification subagent returns:
+Read `{WORKSPACE}/verification/report.md` (Read tool — file must exist). Extract `Status` and
+`Confidence` lines.
 
-1. Verify {WORKSPACE}/verification/report.md exists (Read it)
-2. Extract Status and Confidence from the report
+Read `{WORKSPACE}/goal-state.json`. Update it:
 
-Read {WORKSPACE}/goal-state.json. Update it:
 ```json
 {
   "orchestrator": {
@@ -417,33 +424,7 @@ Read {WORKSPACE}/goal-state.json. Update it:
 }
 ```
 
-Write the updated goal-state.json.
-
-Return this summary to the parent:
-
-```
-ORCHESTRATION COMPLETE
-
-Objective: {OBJECTIVE}
-Completion: [Status from verification report]
-Confidence: [Confidence from verification report]
-Steps executed: [count]
-Workspace: {WORKSPACE}
-
-Key outputs:
-[list each step ID and its output file path]
-
-Verification report: {WORKSPACE}/verification/report.md
-
-[If PARTIAL or NOT_ACHIEVED: list what gaps remain]
-```
-```
-
----
-
-## Step 5 — After Orchestrator Returns
-
-Read `{WORKSPACE}/goal-state.json` to confirm `completion.status`.
+Write the updated `goal-state.json`.
 
 **If VERIFIED:**
 Run the goal helper complete command:
@@ -454,19 +435,19 @@ python3 ~/.claude/skills/goal/scripts/claude_goal.py complete
 ```
 Windows:
 ```powershell
-python "$env:USERPROFILE\.claude\skills\goal\scripts\claude_goal.py" complete
+python "C:\Users\$env:USERNAME\.claude\skills\goal\scripts\claude_goal.py" complete
 ```
 
 Report to the user:
 - Objective achieved
-- Verification report location
+- Verification report location: `{WORKSPACE}/verification/report.md`
 - Final elapsed time from helper output
 
 **If PARTIAL or NOT_ACHIEVED:**
 Report to the user:
-- What was accomplished (from verification report gaps section)
-- What remains
-- Ask: "Shall I continue working on the remaining gaps? If so, run `/goal-sub resume` or describe what to do next."
+- What was accomplished (from the Evidence of Completion section of the verification report)
+- What remains (from the Gaps section)
+- Ask: "Shall I continue working on the remaining gaps? Run `/goal-sub resume` or describe what to do next."
 
 Do NOT run the complete command unless verification status is VERIFIED.
 
@@ -476,11 +457,11 @@ Do NOT run the complete command unless verification status is VERIFIED.
 
 | Command | Behavior |
 |---------|----------|
-| `/goal-sub <objective>` | Register goal, initialize workspace, spawn orchestrator, execute |
+| `/goal-sub <objective>` | Register goal, initialize workspace, decompose and execute via parent |
 | `/goal-sub --tokens 250K <objective>` | Same with soft token budget |
 | `/goal-sub status` | Show current goal (reads from goal helper, no subagent) |
 | `/goal-sub pause` | Pause goal (reads from goal helper, no subagent) |
-| `/goal-sub resume` | Resume goal (reads from goal helper, no subagent) |
+| `/goal-sub resume` | Resume goal — re-enters orchestration at correct step (Step 5, 6, or 7) |
 | `/goal-sub clear` | Delete goal (reads from goal helper, no subagent) |
 | `/goal-sub complete` | Mark complete after manual audit |
 
@@ -488,14 +469,22 @@ Do NOT run the complete command unless verification status is VERIFIED.
 
 ## Key Principles (do not violate)
 
-1. **Parent never does domain work.** If you find yourself writing code, researching, or creating content directly — stop and delegate to a subagent.
+1. **Workers and the verifier are the only subagents.** The parent performs all orchestration
+   directly (Steps 4–7). No intermediate "orchestrator subagent" exists. Any subagent spawned
+   must be a leaf-level worker or verifier — it writes files and returns, never spawns.
 
-2. **State is always on disk first.** Before spawning any subagent, the relevant state must be written to goal-state.json. Subagents read from disk, not from context.
+2. **State is always on disk first.** Before spawning any subagent, the relevant state must be
+   written to goal-state.json. Subagents read from disk, not from context.
 
-3. **Parallel by default, sequential only when required.** Steps with no dependency relationship are always spawned simultaneously. Never make the user wait for sequential work that could be parallel.
+3. **Parallel by default, sequential only when required.** Steps with no dependency relationship
+   are always spawned simultaneously in a single message. Never make the user wait for
+   sequential work that could be parallel.
 
-4. **File existence is the only valid completion signal.** Trust no return message from a subagent. Verify the output file exists.
+4. **File existence is the only valid completion signal.** Trust no return message from a
+   subagent. Verify the output file exists using Read or Glob.
 
-5. **Narrow scope per worker.** Each worker does exactly one step. This bounds context pressure and makes failures localized and recoverable.
+5. **Narrow scope per worker.** Each worker does exactly one step. This bounds context pressure
+   and makes failures localized and recoverable.
 
-6. **Goal anchor in every subagent.** Every worker and the verification subagent receive the objective in a GOAL ANCHOR block. The goal is never assumed — always injected.
+6. **Goal anchor in every subagent.** Every worker and the verification subagent receive the
+   objective in a GOAL ANCHOR block. The goal is never assumed — always injected.

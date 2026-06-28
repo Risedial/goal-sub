@@ -8,14 +8,8 @@ argument-hint: "[status|pause|resume|clear|complete] [--tokens N] <objective>"
 
 Run the helper first, then obey the returned "Claude instructions":
 
-**macOS / Linux:**
 ```bash
 python3 ~/.claude/skills/goal/scripts/claude_goal.py invoke "$ARGUMENTS"
-```
-
-**Windows (PowerShell):**
-```powershell
-python "$env:USERPROFILE\.claude\skills\goal\scripts\claude_goal.py" invoke "$ARGUMENTS"
 ```
 
 The helper persists goal state in `~/.claude/goal/goals.sqlite` and implements the Codex-inspired command surface:
@@ -42,14 +36,8 @@ Before marking a goal complete, run a real completion audit:
 5. Continue work if anything is missing.
 6. Only after the audit passes, run:
 
-**macOS / Linux:**
 ```bash
 python3 ~/.claude/skills/goal/scripts/claude_goal.py complete
-```
-
-**Windows:**
-```powershell
-python "$env:USERPROFILE\.claude\skills\goal\scripts\claude_goal.py" complete
 ```
 
 Then report final elapsed time and any soft budget state.
